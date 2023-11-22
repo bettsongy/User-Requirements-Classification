@@ -1,113 +1,170 @@
 import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
-from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
-from sklearn.linear_model import SGDClassifier
-import nltk
-nltk.download('wordnet')
-nltk.download('stopwords')
-
-from sklearn.metrics import classification_report, confusion_matrix
-from imblearn.over_sampling import SMOTE
-from sklearn.preprocessing import normalize
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.metrics import classification_report
+from sklearn.preprocessing import MinMaxScaler
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.svm import SVC
 from sklearn.tree import DecisionTreeClassifier
-from sklearn.feature_extraction.text import TfidfVectorizer
+from scipy.sparse import hstack, csr_matrix
 from nltk.stem import WordNetLemmatizer
 from nltk.corpus import stopwords
+import nltk
+import re
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import make_pipeline  # Corrected import
+
+
+# Ensure nltk resources are downloaded
+nltk.download('punkt')
+nltk.download('wordnet')
+nltk.download('stopwords')
+
 import re
 
-def load_and_label_data(file_paths, labels):
+# Load data
+
+
+def load_data(paths):
     dataframes = []
-    for path, label in zip(file_paths, labels):
+    for path in paths:
         df = pd.read_json(path)
-        df['label'] = label
-        # Split into target and complement classes if necessary
-        df_target = df[df['label'] == label]
-        df_complement = df[df['label'] != label]
-        # Rename complement label
-        df_complement['label'] = 'Not_' + label
-        dataframes.extend([df_target, df_complement])
+        dataframes.append(df)
     return pd.concat(dataframes, ignore_index=True)
 
+
+def train_model_with_hyperparameter_tuning(X_train, y_train):
+    # Define the parameter grid for RandomForest
+    param_grid_rf = {
+        'n_estimators': [100, 200, 300],
+        'max_depth': [10, 20, 30],
+        'min_samples_split': [2, 5, 10]
+    }
+    rf = RandomForestClassifier()
+    grid_search_rf = GridSearchCV(
+        estimator=rf, param_grid=param_grid_rf, cv=3, n_jobs=-1, scoring='accuracy')
+    grid_search_rf.fit(X_train, y_train)
+    return grid_search_rf.best_estimator_
+
+# Preprocess text
+
 def preprocess_text(text):
-    # Custom lemmatization
     lemmatizer = WordNetLemmatizer()
-    words = text.split()
-    lemmatized_words = [lemmatizer.lemmatize(word) for word in words]
-    
-    # Stopword removal
     stop_words = set(stopwords.words('english'))
-    filtered_words = [word for word in lemmatized_words if word not in stop_words]
-    
-    # Rejoin words
-    return ' '.join(filtered_words)
+    # Text normalization and tokenization
+    text = re.sub(r'[^a-zA-Z0-9]', ' ', str(text).lower())
+    tokens = nltk.word_tokenize(text)
+    # Lemmatization and stopword removal
+    processed_text = ' '.join([lemmatizer.lemmatize(word)
+                               for word in tokens if word not in stop_words and len(word) > 1])
+    return processed_text
 
 
 def preprocess_data(data):
-    # Convert columns to object type before filling NaN values
-    data = data.astype(object).fillna('')
-    # Combine 'comment' with other fields and preprocess
-    data['combined_text'] = data.apply(lambda row: preprocess_text(row['comment'] + ' ' + (row['title'] if pd.notnull(row['title']) else '')), axis=1)
+    # Handle NaN values in text columns
+    data['comment'] = data['comment'].fillna('')
+    data['title'] = data['title'].fillna('')
+
+    # Apply text preprocessing
+    data['processed_text'] = data.apply(lambda row: preprocess_text(
+        row['comment'] + ' ' + row['title']), axis=1)
+
+    # Replace NaN with 0 before scaling
+    data['sentiScore'] = data['sentiScore'].fillna(0)
+    data['rating'] = data['rating'].fillna(0)
+
+    # Apply MinMaxScaler
+    scaler = MinMaxScaler()
+    data[['sentiScore_norm', 'rating_norm']] = scaler.fit_transform(
+        data[['sentiScore', 'rating']])
+
     return data
 
-def feature_extraction(data, column='combined_text', max_features=1000):
-    # Using CountVectorizer for Word Count Vectors
-    vectorizer = CountVectorizer(max_features=max_features, ngram_range=(1,2))
-    features = vectorizer.fit_transform(data[column])
-    # Normalize the feature matrix
-    features = normalize(features)
-    return features
+# Feature extraction
+def feature_extraction(data):
+    vectorizer = TfidfVectorizer(max_features=1000)
+    text_features = vectorizer.fit_transform(data['processed_text'])
 
-def train_and_evaluate_model(X, y, model, params=None, cv=5):
-    # Addressing data imbalance
-    smote = SMOTE()
-    X_res, y_res = smote.fit_resample(X, y)
+    # Convert the DataFrame to a sparse matrix
+    additional_features = csr_matrix(
+        data[['sentiScore_norm', 'rating_norm']].to_numpy())
 
-    # Hyperparameter tuning using GridSearchCV if parameters are provided
-    if params:
-        model = GridSearchCV(model, params, cv=cv, scoring='accuracy')
-    
-    # Cross-validation
-    scores = cross_val_score(model, X_res, y_res, cv=cv)
-    print(f"Cross-Validation Scores: {scores}")
-    print(f"Mean CV Score: {scores.mean()}")
+    # Combine with text features
+    combined_features = hstack([text_features, additional_features])
+    return combined_features
+# Train and evaluate models
 
-    # Splitting the data for final evaluation
-    X_train, X_test, y_train, y_test = train_test_split(X_res, y_res, test_size=0.2)
 
-    # Train the classifier
-    model.fit(X_train, y_train)
+def train_and_evaluate(data, labels):
+    X_train, X_test, y_train, y_test = train_test_split(
+        data, labels, test_size=0.2)
 
-    # Predictions and final evaluation
-    y_pred = model.predict(X_test)
-    # Print classification report and confusion matrix
-    print(f"Classification Report for {type(model).__name__}:\n")
-    print(classification_report(y_test, y_pred))
-    print("Confusion Matrix:\n")
-    print(confusion_matrix(y_test, y_pred))
-    print("\n" + "="*80 + "\n")
+    # Define hyperparameter grids
+    rf_grid = {
+        'randomforestclassifier__n_estimators': [100, 200, 300, 500],
+        'randomforestclassifier__max_depth': [10, 20, 30, None],
+        'randomforestclassifier__min_samples_split': [2, 5, 10],
+        'randomforestclassifier__min_samples_leaf': [1, 2, 4],
+        'randomforestclassifier__bootstrap': [True, False]
+    }
+    svm_grid = {
+        'svc__C': [0.1, 1, 10, 100],
+        'svc__gamma': ['scale', 'auto', 0.1, 1, 10],
+        'svc__kernel': ['rbf', 'poly', 'sigmoid']
+    }
+    nb_grid = {
+        'multinomialnb__alpha': [1.0, 0.5, 0.1, 0.01, 0.001]
+    }
+    dt_grid = {
+        'decisiontreeclassifier__max_depth': [5, 10, 15, 20, None],
+        'decisiontreeclassifier__min_samples_split': [2, 5, 10],
+        'decisiontreeclassifier__min_samples_leaf': [1, 2, 4],
+        'decisiontreeclassifier__criterion': ['gini', 'entropy']
+    }
 
-# Paths to your JSON files and labels
-file_paths = ['bug_tt.json', 'feature_tt.json', 'rating_tt.json', 'UserExperience_tt.json']
-labels = ['Bug', 'Feature', 'Rating', 'UserExperience']
+    # Models with their corresponding hyperparameter grids
 
-# Load and preprocess data
-data = load_and_label_data(file_paths, labels)
+    models = {
+        'RandomForest': (RandomForestClassifier(), rf_grid),
+        'SVM': (SVC(), svm_grid),
+        'NaiveBayes': (MultinomialNB(), nb_grid),
+        'DecisionTree': (DecisionTreeClassifier(), dt_grid)
+    }
+
+    for name, (model, grid) in models.items():
+        print(f"Training and evaluating {name}")
+
+        # Define the pipeline with named steps
+        model_pipeline = make_pipeline(
+            SMOTE(),
+            model
+        )
+
+        grid_search = GridSearchCV(
+            estimator=model_pipeline, param_grid=grid, cv=3, n_jobs=-1, scoring='accuracy')
+        grid_search.fit(X_train, y_train)
+
+        best_model = grid_search.best_estimator_
+        y_pred = best_model.predict(X_test)
+
+        print(f"Results for {name} with Hyperparameter Tuning:")
+        print(classification_report(y_test, y_pred))
+        print("="*30)
+
+
+
+# Paths to JSON files
+file_paths = [
+    'Bug_tt.json',
+    'Feature_tt.json',
+    'Rating_tt.json',
+    'UserExperience_tt.json'
+]
+
+
+# Main execution
+data = load_data(file_paths)
 data = preprocess_data(data)
-
-# Define models and hyperparameters
-models = {
-    'RandomForest': (RandomForestClassifier(), {'n_estimators': [100, 200], 'max_depth': [10, 20]}),
-    'NaiveBayes': (MultinomialNB(), {'alpha': [1.0, 0.5, 0.1]}),
-    'SVM': (SVC(), {'C': [1, 10], 'kernel': ['linear', 'rbf']}),
-    'DecisionTree': (DecisionTreeClassifier(), {'max_depth': [5, 10, 15]}),
-    'SGD': (SGDClassifier(), {'loss': ['hinge', 'log'], 'alpha': [0.0001, 0.001], 'penalty': ['l2', 'l1']})
-}
-
-# Train and evaluate each model
-for model_name, (model, params) in models.items():
-    print(f"Training and evaluating {model_name}")
-    X = feature_extraction(data)
-    train_and_evaluate_model(X, data['label'], model, params)
+features = feature_extraction(data)
+train_and_evaluate(features, data['label'])
